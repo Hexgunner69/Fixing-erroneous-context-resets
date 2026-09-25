@@ -9,6 +9,7 @@ import {
   activityLog,
   agentWakeupRequests,
   agentRuntimeState,
+  agentTaskSessions,
   agents,
   approvals,
   assets,
@@ -87,6 +88,7 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
     await db.delete(activityLog);
     try {
       await db.delete(heartbeatRunEvents);
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       await db.delete(agentWakeupRequests);
       return;

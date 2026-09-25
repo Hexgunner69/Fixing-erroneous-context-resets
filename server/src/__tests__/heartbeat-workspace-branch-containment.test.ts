@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -178,6 +179,7 @@ async function deleteHeartbeatRunsForCleanup(db: Db) {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     try {
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       return;
     } catch (error) {

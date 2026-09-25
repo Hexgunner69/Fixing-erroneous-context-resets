@@ -6,6 +6,7 @@ import {
   agents,
   agentWakeupRequests,
   agentRuntimeState,
+  agentTaskSessions,
   companySkills,
   companies,
   createDb,
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       await db.delete(heartbeatRunEvents);
       await db.delete(activityLog);
       try {
+        await db.delete(agentTaskSessions);
         await db.delete(heartbeatRuns);
         return;
       } catch (error) {

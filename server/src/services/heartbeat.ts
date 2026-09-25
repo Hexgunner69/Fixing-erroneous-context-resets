@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -353,6 +353,7 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
+const PAPERCLIP_RETURN_ASSIGNMENT_KEY = "paperclipReturnAssignment";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
@@ -4116,10 +4117,16 @@ export function deriveTaskKeyWithHeartbeatFallback(
 
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { returningAssignee?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  // An assignment starts a fresh session, except when the task is handed back
+  // to an agent that still holds a healthy session for it (see
+  // resolveReturnAssignmentTaskSession). That session still has to pass the
+  // effective-config and workspace freshness checks before it is resumed.
+  if (wakeReason === "issue_assigned" && options.returningAssignee === true) return false;
   if (
     wakeReason === "issue_assigned" ||
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
@@ -4133,6 +4140,62 @@ export function shouldResetTaskSessionForWake(
     return true;
   }
   return false;
+}
+
+// A task handed back to an agent that already holds a session for it. Only a
+// healthy session qualifies: an explicit fresh-session request, a tombstoned
+// or missing session, or one whose last run failed all keep the assignment
+// reset.
+export function resolveReturnAssignmentTaskSession(input: {
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId" | "lastError" | "updatedAt"> | null;
+}) {
+  if (input.contextSnapshot?.forceFreshSession === true) return null;
+  if (readNonEmptyString(input.contextSnapshot?.wakeReason) !== "issue_assigned") return null;
+  const session = input.taskSession;
+  if (!session || session.lastError) return null;
+  return { checkpointAt: session.updatedAt, lastRunId: session.lastRunId };
+}
+
+// Comments other authors posted on the issue since the returning agent's last
+// checkpointed run started (a comment posted during that run may never have
+// reached it), newest last. At most `limit` are returned; `truncated` says
+// older ones were left for the agent to fetch.
+async function listReturnAssignmentInterveningCommentIds(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    checkpointRunId: string | null;
+    checkpointAt: Date;
+    limit: number;
+  },
+) {
+  const checkpointRunStartedAt = input.checkpointRunId
+    ? await db
+      .select({ startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.checkpointRunId), eq(heartbeatRuns.companyId, input.companyId)))
+      .then((rows) => rows[0]?.startedAt ?? null)
+    : null;
+  const since = checkpointRunStartedAt ?? input.checkpointAt;
+  const rows = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, input.issueId),
+      gt(issueComments.createdAt, since),
+      isNull(issueComments.deletedAt),
+      or(isNull(issueComments.authorAgentId), ne(issueComments.authorAgentId, input.agentId)),
+    ))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+    .limit(input.limit + 1);
+  return {
+    commentIds: rows.slice(0, input.limit).map((row) => row.id).reverse(),
+    truncated: rows.length > input.limit,
+  };
 }
 
 function shouldRequireIssueCommentForWake(
@@ -4228,11 +4291,14 @@ export function filterZombieCoalesceTarget<
 
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { returningAssignee?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_assigned") {
+    return options.returningAssignee === true ? null : "wake reason is issue_assigned";
+  }
   if (wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON) {
     return `wake reason is ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON}`;
   }
@@ -4325,6 +4391,11 @@ type EffectiveRunSessionConfigMetadata = {
   categories: EffectiveRunSessionConfigCategory[];
   categoryFingerprints: Record<EffectiveRunSessionConfigCategory, string>;
   fingerprints: EffectiveRunConfigFingerprints;
+  // modelProfile category fingerprints that sessions checkpointed before
+  // model-profile normalization could have stored for this same effective
+  // configuration (any request metadata that normalizes to the same value).
+  // Accepted as equivalent so the normalization does not reset them.
+  legacyCompatibleModelProfileFingerprints?: string[];
 };
 
 type TaskSessionConfigFreshnessDecision = {
@@ -4594,11 +4665,17 @@ function describeEffectiveRunConfigCategories(categories: readonly EffectiveRunS
 function changedEffectiveRunSessionConfigCategories(input: {
   previous: Partial<Record<EffectiveRunSessionConfigCategory, string>>;
   next: Record<EffectiveRunSessionConfigCategory, string>;
+  legacyCompatibleModelProfileFingerprints?: readonly string[];
 }) {
-  const changed = EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES.filter(
-    (category) => input.previous[category] !== input.next[category],
-  );
-  return changed.length > 0 ? changed : [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES];
+  return EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES.filter((category) => {
+    const previous = input.previous[category];
+    if (previous === input.next[category]) return false;
+    return !(
+      category === "modelProfile"
+      && previous !== undefined
+      && input.legacyCompatibleModelProfileFingerprints?.includes(previous)
+    );
+  });
 }
 
 function parseStoredWorkspaceConfigCategoryFingerprints(value: unknown) {
@@ -4821,6 +4898,54 @@ async function resolveInstructionsConfigFingerprintMetadata(config: Record<strin
   return metadata;
 }
 
+// The modelProfile category records the profile the adapter actually ran
+// with. Who requested which profile, and why a request fell back, is audit
+// metadata for run results: a disabled or unsupported request applies no
+// override, so it must not fork the session fingerprint. The override an
+// applied profile does make is fingerprinted through adapterConfig as well.
+export function normalizeModelProfileForSessionFingerprint(modelProfile: unknown) {
+  const metadata = parseObject(modelProfile);
+  const applied = metadata.applied ?? null;
+  if (applied === null || applied === false) return null;
+  return { applied, configSource: metadata.configSource ?? null };
+}
+
+// Every value 2026.824.1 could have recorded for the modelProfile category
+// (the raw modelProfileRunMetadata) that normalizes to `normalized`. The
+// request sources and fallback reasons are the closed sets that version wrote.
+const LEGACY_MODEL_PROFILE_REQUEST_SOURCES: ModelProfileRequestSource[] = ["issue_override", "wake_context"];
+const LEGACY_MODEL_PROFILE_FALLBACK_REASONS = [
+  "adapter_profile_not_supported",
+  "adapter_profile_resolution_failed",
+  "agent_runtime_profile_disabled",
+];
+
+function legacyModelProfileMetadataCandidates(
+  normalized: ReturnType<typeof normalizeModelProfileForSessionFingerprint>,
+): unknown[] {
+  if (!normalized) {
+    return [
+      null,
+      ...MODEL_PROFILE_KEYS.flatMap((requested) =>
+        LEGACY_MODEL_PROFILE_REQUEST_SOURCES.flatMap((requestedBy) =>
+          LEGACY_MODEL_PROFILE_FALLBACK_REASONS.map((fallbackReason) => ({
+            requested,
+            requestedBy,
+            applied: null,
+            configSource: null,
+            fallbackReason,
+          })))),
+    ];
+  }
+  return LEGACY_MODEL_PROFILE_REQUEST_SOURCES.map((requestedBy) => ({
+    requested: normalized.applied,
+    requestedBy,
+    applied: normalized.applied,
+    configSource: normalized.configSource,
+    fallbackReason: null,
+  }));
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -4851,7 +4976,7 @@ function buildSessionConfigCategoryValues(input: {
     },
     adapterConfig: input.effectiveAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
-    modelProfile: input.modelProfile,
+    modelProfile: normalizeModelProfileForSessionFingerprint(input.modelProfile),
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig,
@@ -4909,12 +5034,25 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     subcategories: EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES,
     secretManifest,
   });
+  const legacyCompatibleModelProfileFingerprints = [
+    ...new Set(
+      [...legacyModelProfileMetadataCandidates(categoryValues.modelProfile), input.modelProfile]
+        .map((modelProfile) => createEffectiveRunConfigSubcategoryFingerprints({
+          category: "session",
+          value: { modelProfile },
+          subcategories: ["modelProfile"] as const,
+          secretManifest,
+        }).modelProfile)
+        .filter((fingerprint) => fingerprint !== categoryFingerprints.modelProfile),
+    ),
+  ];
   return {
     version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
     fingerprint: fingerprints.sessionFingerprint.fingerprint,
     categories: [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES],
     categoryFingerprints,
     fingerprints,
+    legacyCompatibleModelProfileFingerprints,
   };
 }
 
@@ -5232,13 +5370,19 @@ export function resolveTaskSessionConfigFreshness(input: {
         `effective run configuration fingerprint version changed from ${storedConfig.version} to ${input.configMetadata.version}`,
       );
     } else if (storedConfig && storedConfig.fingerprint !== input.configMetadata.fingerprint) {
+      // Compare category by category: a session is compatible only when every
+      // category matches, the modelProfile category possibly in legacy form.
+      // A stored session missing category fingerprints never matches.
       changedCategories = changedEffectiveRunSessionConfigCategories({
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
+        legacyCompatibleModelProfileFingerprints: input.configMetadata.legacyCompatibleModelProfileFingerprints,
       });
-      reasons.push(
-        `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
-      );
+      if (changedCategories.length > 0) {
+        reasons.push(
+          `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
+        );
+      }
     }
   }
 
@@ -5559,7 +5703,21 @@ export async function buildPaperclipWakePayload(input: {
   simplifiedEnglishInteractions?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const wakeCommentIds = extractWakeCommentIds(input.contextSnapshot);
+  const returnAssignment = parseObject(input.contextSnapshot[PAPERCLIP_RETURN_ASSIGNMENT_KEY]);
+  const interveningCandidates = (Array.isArray(returnAssignment.interveningCommentIds)
+    ? returnAssignment.interveningCommentIds
+    : [])
+    .map((value) => readNonEmptyString(value))
+    .filter((value): value is string => value !== null && !wakeCommentIds.includes(value));
+  // Keep the comments that actually triggered this wake; fill the remaining
+  // inline slots with the newest intervening comments.
+  const interveningRoom = Math.max(0, MAX_INLINE_WAKE_COMMENTS - wakeCommentIds.length);
+  const interveningCommentIds = interveningRoom > 0 ? interveningCandidates.slice(-interveningRoom) : [];
+  const interveningCommentsTruncated =
+    returnAssignment.interveningCommentsTruncated === true
+    || interveningCommentIds.length < interveningCandidates.length;
+  const commentIds = [...interveningCommentIds, ...wakeCommentIds];
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const continuationSummary = input.continuationSummary ?? null;
@@ -5760,7 +5918,8 @@ export async function buildPaperclipWakePayload(input: {
       includeForAnnotationDelta: annotationDeltas.length > 0,
     })
     : null;
-  const payloadTruncated = truncated || issueDescriptionTruncated || planReviewContext?.truncated === true || documentReviewContext?.truncated === true;
+  const payloadTruncated = truncated || issueDescriptionTruncated || planReviewContext?.truncated === true || documentReviewContext?.truncated === true
+    || interveningCommentsTruncated;
   const recoveryActionId = readNonEmptyString(input.contextSnapshot.recoveryActionId);
   const recoveryCause = readNonEmptyString(input.contextSnapshot.recoveryCause);
   const recoveryAction = recoveryActionId
@@ -6663,6 +6822,152 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export type FinalizeRunTaskSessionMutation =
+  | {
+      kind: "upsert";
+      companyId: string;
+      agentId: string;
+      adapterType: string;
+      taskKey: string;
+      sessionParamsJson: Record<string, unknown> | null;
+      sessionDisplayId: string | null;
+      lastError: string | null;
+    }
+  | {
+      kind: "clear";
+      companyId: string;
+      agentId: string;
+      adapterType: string;
+      taskKey: string;
+    };
+
+// A task-session row whose params and display id are both null is a tombstone:
+// runtime lookups treat it as "no session", but it still orders later writes.
+// A clear by a run records that run in lastRunId, so it orders by the run's
+// (start, id) exactly like a live checkpoint. An explicit reset has no run:
+// lastRunId is null and updatedAt is the reset time.
+export function isTaskSessionTombstone(
+  row: Pick<typeof agentTaskSessions.$inferSelect, "sessionParamsJson" | "sessionDisplayId"> | null | undefined,
+) {
+  return !!row && row.sessionParamsJson == null && row.sessionDisplayId == null;
+}
+
+const liveTaskSessionCondition = or(
+  isNotNull(agentTaskSessions.sessionParamsJson),
+  isNotNull(agentTaskSessions.sessionDisplayId),
+);
+
+// Runs are ordered by when they actually started (falling back to creation for
+// runs that never started), with the id as a tiebreaker.
+function heartbeatRunSessionOrderKey(alias: string) {
+  return sql.raw(`(coalesce(${alias}.started_at, ${alias}.created_at), ${alias}.id)`);
+}
+
+// True when the existing agent_task_sessions row (the ON CONFLICT target) must
+// win over `runId`'s checkpoint: a live session or clear written by a run
+// ordered after `runId` by (start, id), or an explicit reset at or after
+// `runId`'s start. On an exact tie with a reset it is unknown whether the run
+// read the session before or after the reset, so the reset wins: the worst
+// case is a fresh start, never a stale resume.
+function taskSessionIsNewerThanRun(runId: string) {
+  return sql`(
+    case
+      when ${agentTaskSessions.lastRunId} is null then (
+        ${agentTaskSessions.sessionParamsJson} is null
+        and ${agentTaskSessions.sessionDisplayId} is null
+        and ${agentTaskSessions.updatedAt} >= (
+          select coalesce(current_run.started_at, current_run.created_at)
+          from ${heartbeatRuns} as current_run
+          where current_run.id = ${runId}::uuid
+        )
+      )
+      else exists (
+        select 1
+        from ${heartbeatRuns} as session_run
+        join ${heartbeatRuns} as current_run on current_run.id = ${runId}::uuid
+        where session_run.id = ${agentTaskSessions.lastRunId}
+          and ${heartbeatRunSessionOrderKey("session_run")} > ${heartbeatRunSessionOrderKey("current_run")}
+      )
+    end
+  )`;
+}
+
+// Commits a run's terminal status and its task-session checkpoint in one
+// transaction, so nothing that observes the terminal run (live events, issue
+// execution release, queued follow-up promotion) can see it before the session
+// it produced. The run write is a compare-and-set over `expectedStatuses`; when
+// it loses, no session write happens. The session write is ordered: it never
+// replaces a session written by a run that started later, or one cleared after
+// this run started. Clears are persisted as tombstones for the same reason.
+export async function finalizeRunningRunWithTaskSession(
+  db: Db,
+  input: {
+    runId: string;
+    status: string;
+    patch?: Partial<typeof heartbeatRuns.$inferInsert>;
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null;
+    expectedStatuses?: readonly string[];
+  },
+) {
+  const expectedStatuses = input.expectedStatuses ?? ["running"];
+  if (expectedStatuses.length === 0) {
+    throw new Error("Run finalization requires at least one expected status");
+  }
+  const updated = await db.transaction(async (tx) => {
+    const run = await tx
+      .update(heartbeatRuns)
+      .set({ status: input.status, ...input.patch, updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, input.runId), inArray(heartbeatRuns.status, [...expectedStatuses])))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!run) return null;
+
+    const mutation = input.taskSessionMutation;
+    if (mutation) {
+      // A clear is a tombstone that keeps lastRunId, so it orders by this
+      // run's (start, id) the same way a live checkpoint does.
+      const upsert = mutation.kind === "upsert" ? mutation : null;
+      const values = {
+        sessionParamsJson: upsert?.sessionParamsJson ?? null,
+        sessionDisplayId: upsert?.sessionDisplayId ?? null,
+        lastRunId: run.id,
+        lastError: upsert?.lastError ?? null,
+        updatedAt: new Date(),
+      };
+      await tx
+        .insert(agentTaskSessions)
+        .values({
+          companyId: mutation.companyId,
+          agentId: mutation.agentId,
+          adapterType: mutation.adapterType,
+          taskKey: mutation.taskKey,
+          ...values,
+        })
+        .onConflictDoUpdate({
+          target: [
+            agentTaskSessions.companyId,
+            agentTaskSessions.agentId,
+            agentTaskSessions.adapterType,
+            agentTaskSessions.taskKey,
+          ],
+          set: values,
+          setWhere: sql`not ${taskSessionIsNewerThanRun(run.id)}`,
+        });
+    }
+
+    return run;
+  });
+
+  if (updated) return { run: updated, updated: true as const };
+
+  const current = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, input.runId))
+    .then((rows) => rows[0] ?? null);
+  return { run: current, updated: false as const };
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -7483,7 +7788,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(agentTaskSessions.taskKey, taskKey),
         ),
       )
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => {
+        const row = rows[0] ?? null;
+        return isTaskSessionTombstone(row) ? null : row;
+      });
   }
 
   async function getLatestRunForSession(
@@ -8798,53 +9106,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function upsertTaskSession(input: {
-    companyId: string;
-    agentId: string;
-    adapterType: string;
-    taskKey: string;
-    sessionParamsJson: Record<string, unknown> | null;
-    sessionDisplayId: string | null;
-    lastRunId: string | null;
-    lastError: string | null;
-  }) {
-    const existing = await getTaskSession(
-      input.companyId,
-      input.agentId,
-      input.adapterType,
-      input.taskKey,
-    );
-    if (existing) {
-      return db
-        .update(agentTaskSessions)
-        .set({
-          sessionParamsJson: input.sessionParamsJson,
-          sessionDisplayId: input.sessionDisplayId,
-          lastRunId: input.lastRunId,
-          lastError: input.lastError,
-          updatedAt: new Date(),
-        })
-        .where(eq(agentTaskSessions.id, existing.id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-    }
-
-    return db
-      .insert(agentTaskSessions)
-      .values({
-        companyId: input.companyId,
-        agentId: input.agentId,
-        adapterType: input.adapterType,
-        taskKey: input.taskKey,
-        sessionParamsJson: input.sessionParamsJson,
-        sessionDisplayId: input.sessionDisplayId,
-        lastRunId: input.lastRunId,
-        lastError: input.lastError,
-      })
-      .returning()
-      .then((rows) => rows[0] ?? null);
-  }
-
+  // Explicit (operator) clear. Rows become tombstones stamped with the clear
+  // time instead of being deleted, so a run that started before the clear
+  // cannot write its pre-clear session back when it finalizes. Returns the
+  // number of live sessions that were cleared.
   async function clearTaskSessions(
     companyId: string,
     agentId: string,
@@ -8861,11 +9126,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       conditions.push(eq(agentTaskSessions.adapterType, opts.adapterType));
     }
 
-    return db
-      .delete(agentTaskSessions)
-      .where(and(...conditions))
-      .returning()
-      .then((rows) => rows.length);
+    return db.transaction(async (tx) => {
+      const live = await tx
+        .select({ id: agentTaskSessions.id })
+        .from(agentTaskSessions)
+        .where(and(
+          ...conditions,
+          liveTaskSessionCondition,
+        ));
+      const tombstone = {
+        sessionParamsJson: null,
+        sessionDisplayId: null,
+        lastRunId: null,
+        lastError: null,
+        updatedAt: new Date(),
+      };
+      if (opts?.taskKey && opts.adapterType) {
+        // A targeted clear also covers a task whose first run is still in
+        // flight and has not written a row yet.
+        await tx
+          .insert(agentTaskSessions)
+          .values({ companyId, agentId, adapterType: opts.adapterType, taskKey: opts.taskKey, ...tombstone })
+          .onConflictDoUpdate({
+            target: [
+              agentTaskSessions.companyId,
+              agentTaskSessions.agentId,
+              agentTaskSessions.adapterType,
+              agentTaskSessions.taskKey,
+            ],
+            set: tombstone,
+          });
+      } else {
+        await tx.update(agentTaskSessions).set(tombstone).where(and(...conditions));
+      }
+      return live.length;
+    });
   }
 
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
@@ -8925,48 +9220,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null,
   ) {
-    return setRunStatusFromLive(runId, status, ["running"], patch);
+    return setRunStatusFromLive(runId, status, ["running"], patch, taskSessionMutation);
   }
 
   // Move a run to a new status only when its current status is one of
   // `fromStatuses`. The compare-and-set is a single conditional update, so a
   // concurrent path can win the race. When this update matches nothing, the
   // function reads the current row and reports updated=false, so the caller can
-  // keep the terminal outcome that another path already wrote.
+  // keep the terminal outcome that another path already wrote. A task-session
+  // mutation, when given, commits in the same transaction as the status write,
+  // before any live event or follow-up can observe the new status.
   async function setRunStatusFromLive(
     runId: string,
     status: string,
-    fromStatuses: string[],
+    fromStatuses: readonly string[],
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, fromStatuses)))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const finalization = await finalizeRunningRunWithTaskSession(db, {
+      runId,
+      status,
+      patch,
+      taskSessionMutation,
+      expectedStatuses: fromStatuses,
+    });
+    if (!finalization.updated) return finalization;
 
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
-      return { run: updated, updated: true as const };
+    const updated = finalization.run;
+    if (isHeartbeatRunTerminalStatus(updated.status)) {
+      clearHeartbeatRunRuntimeStatus(updated.id);
     }
-
-    const current = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-
-    return { run: current, updated: false as const };
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+    });
+    publishRunLifecyclePluginEvent(updated);
+    return finalization;
   }
 
   // Invariant: when a run releases its environment lease, the run row must be
@@ -14168,6 +14460,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
+    const returnAssignment = resolveReturnAssignmentTaskSession({ contextSnapshot: context, taskSession });
     const taskSessionDecodedParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
@@ -14241,6 +14534,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     } else {
       delete context.paperclipSkillTest;
+    }
+    if (returnAssignment && issueRef) {
+      const intervening = await listReturnAssignmentInterveningCommentIds(db, {
+        companyId: agent.companyId,
+        issueId: issueRef.id,
+        agentId: agent.id,
+        checkpointRunId: returnAssignment.lastRunId,
+        checkpointAt: returnAssignment.checkpointAt,
+        limit: MAX_INLINE_WAKE_COMMENTS,
+      });
+      context[PAPERCLIP_RETURN_ASSIGNMENT_KEY] = {
+        previousCheckpointAt: returnAssignment.checkpointAt.toISOString(),
+        previousRunId: returnAssignment.lastRunId,
+        interveningCommentIds: intervening.commentIds,
+        interveningCommentsTruncated: intervening.truncated,
+      };
+    } else {
+      delete context[PAPERCLIP_RETURN_ASSIGNMENT_KEY];
     }
     const paperclipWakePayload = await buildPaperclipWakePayload({
       db,
@@ -14685,7 +14996,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
     });
     const configuredModel = readConfiguredModelFromAdapterConfig(runtimeConfig);
-    const wakeSessionResetReason = describeSessionResetReason(context);
+    const returningAssignee = returnAssignment !== null;
+    const wakeSessionResetReason = describeSessionResetReason(context, { returningAssignee });
     const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
       hasTaskSession: taskSession != null,
       configuredModel,
@@ -14694,7 +15006,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeResetReason: wakeSessionResetReason,
       preserveLegacySessionWithoutConfigMetadata: acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
     });
-    const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+    const resetTaskSession = shouldResetTaskSessionForWake(context, { returningAssignee }) || sessionConfigFreshness.reset;
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const previousSessionParams =
@@ -15419,6 +15731,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         changedCategories: sessionConfigFreshness.changedCategories,
         taskSessionAvailable: taskSession != null,
         taskSessionReused: taskSessionForRun != null,
+        returningAssignee,
         storedFingerprintPresent: Boolean(sessionConfigFreshness.storedFingerprint),
         nextFingerprint: sessionConfigFreshness.nextFingerprint,
       },
@@ -16254,6 +16567,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      const taskSessionMutation: FinalizeRunTaskSessionMutation | null = !taskKey
+        ? null
+        : adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)
+          ? {
+              kind: "clear",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+            }
+          : {
+              kind: "upsert",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                nextSessionState.params,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+              sessionDisplayId: nextSessionState.displayId,
+              lastError: runErrorMessage,
+            };
+
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -16268,7 +16606,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
-      });
+      }, taskSessionMutation);
       if (!persistedRunWrite.updated) {
         logger.info(
           {
@@ -16411,29 +16749,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: runErrorMessage,
-            });
-          }
-        }
       }
       await finalizeAgentStatus(
         agent.id,
@@ -16479,6 +16794,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      const failedTaskSessionMutation: FinalizeRunTaskSessionMutation | null =
+        taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)
+          ? {
+              kind: "upsert",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                previousSessionParams,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+              sessionDisplayId: previousSessionDisplayId,
+              lastError: message,
+            }
+          : null;
+
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: message,
         errorCode: failureErrorCode,
@@ -16493,7 +16826,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
-      });
+      }, failedTaskSessionMutation);
       if (!failedRunWrite.updated) {
         logger.info(
           {
@@ -16550,23 +16883,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
-
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
-        }
       }
 
       await finalizeAgentStatus(agent.id, "failed", message, {
@@ -18937,13 +19253,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
+    // The adapter may finalize (and checkpoint its session) while the process
+    // is being terminated; that terminal outcome wins over the cancel.
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    const cancelledWrite = await setRunStatusFromLive(run.id, "cancelled", CANCELLABLE_HEARTBEAT_RUN_STATUSES, {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
     });
+    if (!cancelledWrite.updated) return cancelledWrite.run;
+    const cancelled = cancelledWrite.run;
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -18975,8 +19295,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
+    let cancelledCount = 0;
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const cancelledWrite = await setRunStatusFromLive(run.id, "cancelled", CANCELLABLE_HEARTBEAT_RUN_STATUSES, {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -18988,11 +19309,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
         } : {}),
       });
-
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-      });
+      const cancelled = cancelledWrite.updated ? cancelledWrite.run : null;
+      if (cancelled) {
+        cancelledCount += 1;
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: new Date(),
+          error: reason,
+        });
+      }
 
       const running = runningProcesses.get(run.id);
       if (running) {
@@ -19008,10 +19332,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      if (cancelled) {
+        await releaseIssueExecutionAndPromote(cancelled);
+      }
     }
 
-    return runs.length;
+    return cancelledCount;
   }
 
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
@@ -19211,7 +19537,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const latestTaskSession = await db
         .select()
         .from(agentTaskSessions)
-        .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id)))
+        .where(and(
+          eq(agentTaskSessions.companyId, agent.companyId),
+          eq(agentTaskSessions.agentId, agent.id),
+          liveTaskSessionCondition,
+        ))
         .orderBy(desc(agentTaskSessions.updatedAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
@@ -19229,7 +19559,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return db
         .select()
         .from(agentTaskSessions)
-        .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId)))
+        .where(and(
+          eq(agentTaskSessions.companyId, agent.companyId),
+          eq(agentTaskSessions.agentId, agentId),
+          liveTaskSessionCondition,
+        ))
         .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt));
     },
 

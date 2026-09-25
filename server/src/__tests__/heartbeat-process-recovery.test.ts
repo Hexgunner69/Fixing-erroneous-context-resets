@@ -9,6 +9,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   authUsers,
   budgetPolicies,
@@ -415,6 +416,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await db.delete(activityLog);
       await db.delete(heartbeatRunEvents);
       try {
+        await db.delete(agentTaskSessions);
         await db.delete(heartbeatRuns);
         break;
       } catch (error) {

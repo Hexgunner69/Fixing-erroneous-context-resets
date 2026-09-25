@@ -6,6 +6,7 @@ import {
   agents,
   agentWakeupRequests,
   agentRuntimeState,
+  agentTaskSessions,
   budgetPolicies,
   companies,
   companyMemberships,
@@ -115,6 +116,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
