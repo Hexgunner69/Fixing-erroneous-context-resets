@@ -63,6 +63,7 @@ async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await db.delete(heartbeatRunEvents);
     try {
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       return;
     } catch (error) {
@@ -107,7 +108,6 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issues);
-    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companyMemberships);

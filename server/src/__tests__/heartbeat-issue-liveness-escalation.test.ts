@@ -116,11 +116,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);
-    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companySkills);

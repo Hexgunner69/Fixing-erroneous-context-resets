@@ -157,11 +157,11 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);
-    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(companySkills);

@@ -110,10 +110,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(environmentLeases);
     await db.delete(workspaceRuntimeServices);
     await db.delete(issues);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
-    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companies);

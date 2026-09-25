@@ -179,6 +179,7 @@ async function deleteHeartbeatRunsForCleanup(db: Db) {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     try {
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       return;
     } catch (error) {
@@ -901,7 +902,6 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     await db.delete(projects);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
-    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);

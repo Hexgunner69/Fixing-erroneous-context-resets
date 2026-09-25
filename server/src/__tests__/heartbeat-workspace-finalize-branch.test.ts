@@ -122,6 +122,7 @@ async function deleteHeartbeatRowsAfterActivityLogDrains(db: Db) {
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     try {
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       await db.delete(agentWakeupRequests);
       return;

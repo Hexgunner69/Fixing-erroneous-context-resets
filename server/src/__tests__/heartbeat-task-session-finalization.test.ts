@@ -86,9 +86,9 @@ describeEmbeddedPostgres("heartbeat task-session finalization", () => {
 
   async function insertRun(
     ids: { companyId: string; agentId: string; taskKey: string },
-    opts: { status?: string; startedAt?: Date } = {},
+    opts: { status?: string; startedAt?: Date; id?: string } = {},
   ) {
-    const id = randomUUID();
+    const id = opts.id ?? randomUUID();
     const startedAt = opts.startedAt ?? new Date();
     await db.insert(heartbeatRuns).values({
       id,
@@ -186,8 +186,7 @@ describeEmbeddedPostgres("heartbeat task-session finalization", () => {
 
   it("clears an invalid session atomically as a tombstone", async () => {
     const ids = await seed();
-    const runStartedAt = new Date("2026-07-21T09:00:00.000Z");
-    const runId = await insertRun(ids, { startedAt: runStartedAt });
+    const runId = await insertRun(ids, { startedAt: new Date("2026-07-21T09:00:00.000Z") });
     await db.insert(agentTaskSessions).values({
       companyId: ids.companyId,
       agentId: ids.agentId,
@@ -211,11 +210,8 @@ describeEmbeddedPostgres("heartbeat task-session finalization", () => {
 
     expect((await finalization).updated).toBe(true);
     const tombstone = await sessionRow(ids.taskKey);
-    // The tombstone orders by the clearing run's start instead of referencing
-    // the run, so deleting runs never trips the last_run_id foreign key.
-    expect(tombstone).toMatchObject({ sessionParamsJson: null, sessionDisplayId: null, lastRunId: null });
-    expect(tombstone?.updatedAt.getTime()).toBe(runStartedAt.getTime());
-    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    // The tombstone keeps the clearing run so it orders by (start, id).
+    expect(tombstone).toMatchObject({ sessionParamsJson: null, sessionDisplayId: null, lastRunId: runId });
   }, 20_000);
 
   it("rolls back the terminal status when the session write fails", async () => {
@@ -342,8 +338,7 @@ describeEmbeddedPostgres("heartbeat task-session finalization", () => {
     expect(newerClear.updated).toBe(true);
 
     const tombstone = await sessionRow(ids.taskKey);
-    expect(tombstone).toMatchObject({ sessionParamsJson: null, sessionDisplayId: null, lastRunId: null });
-    expect(tombstone?.updatedAt.toISOString()).toBe("2026-07-21T11:01:00.000Z");
+    expect(tombstone).toMatchObject({ sessionParamsJson: null, sessionDisplayId: null, lastRunId: newerRunId });
   }, 20_000);
 
   it("lets a newer run replace an older run's session", async () => {
@@ -364,6 +359,76 @@ describeEmbeddedPostgres("heartbeat task-session finalization", () => {
       sessionDisplayId: "session-new",
       lastRunId: newerRunId,
       lastError: "boom",
+    });
+  });
+
+  describe("runs with equal start times", () => {
+    const startedAt = new Date("2026-09-25T12:00:00.123Z");
+    const firstRunId = "00000000-0000-4000-8000-000000000001";
+    const secondRunId = "00000000-0000-4000-8000-000000000002";
+
+    it("keeps a clear by the later run authoritative over the earlier run's save", async () => {
+      const ids = await seed();
+      await insertRun(ids, { id: firstRunId, startedAt });
+      await insertRun(ids, { id: secondRunId, startedAt });
+
+      await finalizeRunningRunWithTaskSession(db, { runId: secondRunId, status: "succeeded", taskSessionMutation: clear(ids) });
+      const stale = await finalizeRunningRunWithTaskSession(db, {
+        runId: firstRunId,
+        status: "succeeded",
+        taskSessionMutation: upsert(ids, "old-session"),
+      });
+
+      expect(stale.updated).toBe(true);
+      expect(await sessionRow(ids.taskKey)).toMatchObject({
+        sessionParamsJson: null,
+        sessionDisplayId: null,
+        lastRunId: secondRunId,
+      });
+    });
+
+    it("lets the later run save after the earlier run's clear", async () => {
+      const ids = await seed();
+      await insertRun(ids, { id: firstRunId, startedAt });
+      await insertRun(ids, { id: secondRunId, startedAt });
+
+      await finalizeRunningRunWithTaskSession(db, { runId: firstRunId, status: "succeeded", taskSessionMutation: clear(ids) });
+      await finalizeRunningRunWithTaskSession(db, {
+        runId: secondRunId,
+        status: "succeeded",
+        taskSessionMutation: upsert(ids, "new-session"),
+      });
+
+      expect(await sessionRow(ids.taskKey)).toMatchObject({ sessionDisplayId: "new-session", lastRunId: secondRunId });
+    });
+
+    it("blocks a run that started exactly at an explicit reset, not one that started after it", async () => {
+      const ids = await seed();
+      await db.insert(agentTaskSessions).values({
+        companyId: ids.companyId,
+        agentId: ids.agentId,
+        adapterType: ADAPTER,
+        taskKey: ids.taskKey,
+        sessionParamsJson: null,
+        sessionDisplayId: null,
+        lastRunId: null,
+        updatedAt: startedAt,
+      });
+      const tiedRunId = await insertRun(ids, { startedAt });
+      await finalizeRunningRunWithTaskSession(db, {
+        runId: tiedRunId,
+        status: "succeeded",
+        taskSessionMutation: upsert(ids, "pre-reset-session"),
+      });
+      expect(await sessionRow(ids.taskKey)).toMatchObject({ sessionParamsJson: null, sessionDisplayId: null });
+
+      const laterRunId = await insertRun(ids, { startedAt: new Date(startedAt.getTime() + 1) });
+      await finalizeRunningRunWithTaskSession(db, {
+        runId: laterRunId,
+        status: "succeeded",
+        taskSessionMutation: upsert(ids, "post-reset-session"),
+      });
+      expect(await sessionRow(ids.taskKey)).toMatchObject({ sessionDisplayId: "post-reset-session", lastRunId: laterRunId });
     });
   });
 

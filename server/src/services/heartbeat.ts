@@ -6842,10 +6842,10 @@ export type FinalizeRunTaskSessionMutation =
     };
 
 // A task-session row whose params and display id are both null is a tombstone:
-// runtime lookups treat it as "no session". Its updatedAt records when the
-// session was cleared (the clearing run's start, or the moment of an explicit
-// reset), which stops the finalizer of any run that started earlier from
-// resurrecting it.
+// runtime lookups treat it as "no session", but it still orders later writes.
+// A clear by a run records that run in lastRunId, so it orders by the run's
+// (start, id) exactly like a live checkpoint. An explicit reset has no run:
+// lastRunId is null and updatedAt is the reset time.
 export function isTaskSessionTombstone(
   row: Pick<typeof agentTaskSessions.$inferSelect, "sessionParamsJson" | "sessionDisplayId"> | null | undefined,
 ) {
@@ -6864,15 +6864,18 @@ function heartbeatRunSessionOrderKey(alias: string) {
 }
 
 // True when the existing agent_task_sessions row (the ON CONFLICT target) must
-// win over `runId`'s checkpoint: a live session written by a run that started
-// after `runId`, or a tombstone cleared after `runId` started.
+// win over `runId`'s checkpoint: a live session or clear written by a run
+// ordered after `runId` by (start, id), or an explicit reset at or after
+// `runId`'s start. On an exact tie with a reset it is unknown whether the run
+// read the session before or after the reset, so the reset wins: the worst
+// case is a fresh start, never a stale resume.
 function taskSessionIsNewerThanRun(runId: string) {
   return sql`(
     case
       when ${agentTaskSessions.lastRunId} is null then (
         ${agentTaskSessions.sessionParamsJson} is null
         and ${agentTaskSessions.sessionDisplayId} is null
-        and ${agentTaskSessions.updatedAt} > (
+        and ${agentTaskSessions.updatedAt} >= (
           select coalesce(current_run.started_at, current_run.created_at)
           from ${heartbeatRuns} as current_run
           where current_run.id = ${runId}::uuid
@@ -6921,28 +6924,16 @@ export async function finalizeRunningRunWithTaskSession(
 
     const mutation = input.taskSessionMutation;
     if (mutation) {
-      // A clear is written as a tombstone stamped with this run's start time
-      // rather than a reference to the run, so it orders like the run did
-      // without pinning a heartbeat_runs row.
-      const values = mutation.kind === "upsert"
-        ? {
-            sessionParamsJson: mutation.sessionParamsJson,
-            sessionDisplayId: mutation.sessionDisplayId,
-            lastRunId: run.id,
-            lastError: mutation.lastError,
-            updatedAt: new Date(),
-          }
-        : {
-            sessionParamsJson: null,
-            sessionDisplayId: null,
-            lastRunId: null,
-            lastError: null,
-            updatedAt: sql`(
-              select coalesce(cleared_by_run.started_at, cleared_by_run.created_at)
-              from ${heartbeatRuns} as cleared_by_run
-              where cleared_by_run.id = ${run.id}::uuid
-            )`,
-          };
+      // A clear is a tombstone that keeps lastRunId, so it orders by this
+      // run's (start, id) the same way a live checkpoint does.
+      const upsert = mutation.kind === "upsert" ? mutation : null;
+      const values = {
+        sessionParamsJson: upsert?.sessionParamsJson ?? null,
+        sessionDisplayId: upsert?.sessionDisplayId ?? null,
+        lastRunId: run.id,
+        lastError: upsert?.lastError ?? null,
+        updatedAt: new Date(),
+      };
       await tx
         .insert(agentTaskSessions)
         .values({
