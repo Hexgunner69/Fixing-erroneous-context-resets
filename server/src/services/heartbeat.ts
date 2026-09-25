@@ -4325,6 +4325,13 @@ type EffectiveRunSessionConfigMetadata = {
   categories: EffectiveRunSessionConfigCategory[];
   categoryFingerprints: Record<EffectiveRunSessionConfigCategory, string>;
   fingerprints: EffectiveRunConfigFingerprints;
+  // Fingerprints that sessions checkpointed before model-profile normalization
+  // would have stored for this same effective configuration. Accepted as
+  // equivalent so the normalization does not reset existing sessions.
+  legacyCompatible?: {
+    fingerprint: string;
+    categoryFingerprints: Partial<Record<EffectiveRunSessionConfigCategory, string>>;
+  };
 };
 
 type TaskSessionConfigFreshnessDecision = {
@@ -4594,9 +4601,12 @@ function describeEffectiveRunConfigCategories(categories: readonly EffectiveRunS
 function changedEffectiveRunSessionConfigCategories(input: {
   previous: Partial<Record<EffectiveRunSessionConfigCategory, string>>;
   next: Record<EffectiveRunSessionConfigCategory, string>;
+  legacyCompatible?: Partial<Record<EffectiveRunSessionConfigCategory, string>>;
 }) {
   const changed = EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES.filter(
-    (category) => input.previous[category] !== input.next[category],
+    (category) =>
+      input.previous[category] !== input.next[category]
+      && (input.legacyCompatible?.[category] === undefined || input.previous[category] !== input.legacyCompatible[category]),
   );
   return changed.length > 0 ? changed : [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES];
 }
@@ -4821,6 +4831,18 @@ async function resolveInstructionsConfigFingerprintMetadata(config: Record<strin
   return metadata;
 }
 
+// The modelProfile category records the profile the adapter actually ran
+// with. Who requested which profile, and why a request fell back, is audit
+// metadata for run results: a disabled or unsupported request applies no
+// override, so it must not fork the session fingerprint. The override an
+// applied profile does make is fingerprinted through adapterConfig as well.
+export function normalizeModelProfileForSessionFingerprint(modelProfile: unknown) {
+  const metadata = parseObject(modelProfile);
+  const applied = metadata.applied ?? null;
+  if (applied === null || applied === false) return null;
+  return { applied, configSource: metadata.configSource ?? null };
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -4851,7 +4873,7 @@ function buildSessionConfigCategoryValues(input: {
     },
     adapterConfig: input.effectiveAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
-    modelProfile: input.modelProfile,
+    modelProfile: normalizeModelProfileForSessionFingerprint(input.modelProfile),
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig,
@@ -4909,12 +4931,29 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     subcategories: EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES,
     secretManifest,
   });
+  const legacyCategoryValues = { ...categoryValues, modelProfile: input.modelProfile };
+  const legacyFingerprint = createEffectiveRunConfigFingerprints({
+    session: legacyCategoryValues,
+    secretManifest,
+  }).sessionFingerprint.fingerprint;
+  const legacyCompatible = legacyFingerprint === fingerprints.sessionFingerprint.fingerprint
+    ? undefined
+    : {
+        fingerprint: legacyFingerprint,
+        categoryFingerprints: createEffectiveRunConfigSubcategoryFingerprints({
+          category: "session",
+          value: legacyCategoryValues,
+          subcategories: ["modelProfile"] as const,
+          secretManifest,
+        }),
+      };
   return {
     version: EFFECTIVE_RUN_CONFIG_FINGERPRINT_VERSION,
     fingerprint: fingerprints.sessionFingerprint.fingerprint,
     categories: [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES],
     categoryFingerprints,
     fingerprints,
+    ...(legacyCompatible ? { legacyCompatible } : {}),
   };
 }
 
@@ -5231,10 +5270,15 @@ export function resolveTaskSessionConfigFreshness(input: {
       reasons.push(
         `effective run configuration fingerprint version changed from ${storedConfig.version} to ${input.configMetadata.version}`,
       );
-    } else if (storedConfig && storedConfig.fingerprint !== input.configMetadata.fingerprint) {
+    } else if (
+      storedConfig
+      && storedConfig.fingerprint !== input.configMetadata.fingerprint
+      && storedConfig.fingerprint !== input.configMetadata.legacyCompatible?.fingerprint
+    ) {
       changedCategories = changedEffectiveRunSessionConfigCategories({
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
+        legacyCompatible: input.configMetadata.legacyCompatible?.categoryFingerprints,
       });
       reasons.push(
         `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,

@@ -187,7 +187,7 @@ describeEmbeddedPostgres("heartbeat task-session continuity across queued follow
     await tempDb?.cleanup();
   });
 
-  async function seedAssignedIssue() {
+  async function seedAssignedIssue(runtimeConfig: Record<string, unknown> = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -206,7 +206,7 @@ describeEmbeddedPostgres("heartbeat task-session continuity across queued follow
       status: "active",
       adapterType: "codex_local",
       adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 }, ...runtimeConfig },
       permissions: {},
     });
     await db.insert(issues).values({
@@ -231,7 +231,11 @@ describeEmbeddedPostgres("heartbeat task-session continuity across queued follow
     });
   }
 
-  async function wakeOnUserComment(ids: { companyId: string; agentId: string; issueId: string }, body: string) {
+  async function wakeOnUserComment(
+    ids: { companyId: string; agentId: string; issueId: string },
+    body: string,
+    extraContext: Record<string, unknown> = {},
+  ) {
     const comment = await db
       .insert(issueComments)
       .values({ companyId: ids.companyId, issueId: ids.issueId, authorUserId: "user-1", authorType: "user", body })
@@ -249,6 +253,7 @@ describeEmbeddedPostgres("heartbeat task-session continuity across queued follow
         commentId: comment.id,
         wakeCommentId: comment.id,
         wakeReason: "issue_commented",
+        ...extraContext,
       },
       requestedByActorType: "user",
       requestedByActorId: "user-1",
@@ -502,5 +507,24 @@ describeEmbeddedPostgres("heartbeat task-session continuity across queued follow
     for (const input of followUps) {
       expect(resumedSessionId(input.runId)).not.toBe("session-from-cancelled-run");
     }
+  }, 60_000);
+
+  it("resumes the session when a follow-up requests a model profile the agent has disabled", async () => {
+    const ids = await seedAssignedIssue({ modelProfiles: { cheap: { enabled: false } } });
+    await establishSession(ids, "session-before-cheap-request");
+
+    mockAdapterExecute.mockImplementationOnce(async () => sessionResult("session-before-cheap-request"));
+    const run = await wakeOnUserComment(ids, "Continue, cheaply if you can.", { modelProfile: "cheap" });
+    expect(run).not.toBeNull();
+    expect(await waitForCondition(async () => adapterWasCalledFor(run!.id))).toBe(true);
+    expect(resumedSessionId(run!.id)).toBe("session-before-cheap-request");
+
+    await waitForIdle(ids);
+    const finished = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)).then((rows) => rows[0]!);
+    // The request is still recorded for audit; it just no longer forks the session.
+    expect(finished.resultJson).toMatchObject({
+      modelProfile: { requested: "cheap", applied: null, fallbackReason: "agent_runtime_profile_disabled" },
+      configFreshness: { session: { reset: false, taskSessionReused: true } },
+    });
   }, 60_000);
 });
