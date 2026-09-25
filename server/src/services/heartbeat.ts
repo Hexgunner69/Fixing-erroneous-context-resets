@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6663,6 +6663,161 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export type FinalizeRunTaskSessionMutation =
+  | {
+      kind: "upsert";
+      companyId: string;
+      agentId: string;
+      adapterType: string;
+      taskKey: string;
+      sessionParamsJson: Record<string, unknown> | null;
+      sessionDisplayId: string | null;
+      lastError: string | null;
+    }
+  | {
+      kind: "clear";
+      companyId: string;
+      agentId: string;
+      adapterType: string;
+      taskKey: string;
+    };
+
+// A task-session row whose params and display id are both null is a tombstone:
+// runtime lookups treat it as "no session". Its updatedAt records when the
+// session was cleared (the clearing run's start, or the moment of an explicit
+// reset), which stops the finalizer of any run that started earlier from
+// resurrecting it.
+export function isTaskSessionTombstone(
+  row: Pick<typeof agentTaskSessions.$inferSelect, "sessionParamsJson" | "sessionDisplayId"> | null | undefined,
+) {
+  return !!row && row.sessionParamsJson == null && row.sessionDisplayId == null;
+}
+
+const liveTaskSessionCondition = or(
+  isNotNull(agentTaskSessions.sessionParamsJson),
+  isNotNull(agentTaskSessions.sessionDisplayId),
+);
+
+// Runs are ordered by when they actually started (falling back to creation for
+// runs that never started), with the id as a tiebreaker.
+function heartbeatRunSessionOrderKey(alias: string) {
+  return sql.raw(`(coalesce(${alias}.started_at, ${alias}.created_at), ${alias}.id)`);
+}
+
+// True when the existing agent_task_sessions row (the ON CONFLICT target) must
+// win over `runId`'s checkpoint: a live session written by a run that started
+// after `runId`, or a tombstone cleared after `runId` started.
+function taskSessionIsNewerThanRun(runId: string) {
+  return sql`(
+    case
+      when ${agentTaskSessions.lastRunId} is null then (
+        ${agentTaskSessions.sessionParamsJson} is null
+        and ${agentTaskSessions.sessionDisplayId} is null
+        and ${agentTaskSessions.updatedAt} > (
+          select coalesce(current_run.started_at, current_run.created_at)
+          from ${heartbeatRuns} as current_run
+          where current_run.id = ${runId}::uuid
+        )
+      )
+      else exists (
+        select 1
+        from ${heartbeatRuns} as session_run
+        join ${heartbeatRuns} as current_run on current_run.id = ${runId}::uuid
+        where session_run.id = ${agentTaskSessions.lastRunId}
+          and ${heartbeatRunSessionOrderKey("session_run")} > ${heartbeatRunSessionOrderKey("current_run")}
+      )
+    end
+  )`;
+}
+
+// Commits a run's terminal status and its task-session checkpoint in one
+// transaction, so nothing that observes the terminal run (live events, issue
+// execution release, queued follow-up promotion) can see it before the session
+// it produced. The run write is a compare-and-set over `expectedStatuses`; when
+// it loses, no session write happens. The session write is ordered: it never
+// replaces a session written by a run that started later, or one cleared after
+// this run started. Clears are persisted as tombstones for the same reason.
+export async function finalizeRunningRunWithTaskSession(
+  db: Db,
+  input: {
+    runId: string;
+    status: string;
+    patch?: Partial<typeof heartbeatRuns.$inferInsert>;
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null;
+    expectedStatuses?: readonly string[];
+  },
+) {
+  const expectedStatuses = input.expectedStatuses ?? ["running"];
+  if (expectedStatuses.length === 0) {
+    throw new Error("Run finalization requires at least one expected status");
+  }
+  const updated = await db.transaction(async (tx) => {
+    const run = await tx
+      .update(heartbeatRuns)
+      .set({ status: input.status, ...input.patch, updatedAt: new Date() })
+      .where(and(eq(heartbeatRuns.id, input.runId), inArray(heartbeatRuns.status, [...expectedStatuses])))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!run) return null;
+
+    const mutation = input.taskSessionMutation;
+    if (mutation) {
+      // A clear is written as a tombstone stamped with this run's start time
+      // rather than a reference to the run, so it orders like the run did
+      // without pinning a heartbeat_runs row.
+      const values = mutation.kind === "upsert"
+        ? {
+            sessionParamsJson: mutation.sessionParamsJson,
+            sessionDisplayId: mutation.sessionDisplayId,
+            lastRunId: run.id,
+            lastError: mutation.lastError,
+            updatedAt: new Date(),
+          }
+        : {
+            sessionParamsJson: null,
+            sessionDisplayId: null,
+            lastRunId: null,
+            lastError: null,
+            updatedAt: sql`(
+              select coalesce(cleared_by_run.started_at, cleared_by_run.created_at)
+              from ${heartbeatRuns} as cleared_by_run
+              where cleared_by_run.id = ${run.id}::uuid
+            )`,
+          };
+      await tx
+        .insert(agentTaskSessions)
+        .values({
+          companyId: mutation.companyId,
+          agentId: mutation.agentId,
+          adapterType: mutation.adapterType,
+          taskKey: mutation.taskKey,
+          ...values,
+        })
+        .onConflictDoUpdate({
+          target: [
+            agentTaskSessions.companyId,
+            agentTaskSessions.agentId,
+            agentTaskSessions.adapterType,
+            agentTaskSessions.taskKey,
+          ],
+          set: values,
+          setWhere: sql`not ${taskSessionIsNewerThanRun(run.id)}`,
+        });
+    }
+
+    return run;
+  });
+
+  if (updated) return { run: updated, updated: true as const };
+
+  const current = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, input.runId))
+    .then((rows) => rows[0] ?? null);
+  return { run: current, updated: false as const };
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -7483,7 +7638,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(agentTaskSessions.taskKey, taskKey),
         ),
       )
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => {
+        const row = rows[0] ?? null;
+        return isTaskSessionTombstone(row) ? null : row;
+      });
   }
 
   async function getLatestRunForSession(
@@ -8798,53 +8956,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function upsertTaskSession(input: {
-    companyId: string;
-    agentId: string;
-    adapterType: string;
-    taskKey: string;
-    sessionParamsJson: Record<string, unknown> | null;
-    sessionDisplayId: string | null;
-    lastRunId: string | null;
-    lastError: string | null;
-  }) {
-    const existing = await getTaskSession(
-      input.companyId,
-      input.agentId,
-      input.adapterType,
-      input.taskKey,
-    );
-    if (existing) {
-      return db
-        .update(agentTaskSessions)
-        .set({
-          sessionParamsJson: input.sessionParamsJson,
-          sessionDisplayId: input.sessionDisplayId,
-          lastRunId: input.lastRunId,
-          lastError: input.lastError,
-          updatedAt: new Date(),
-        })
-        .where(eq(agentTaskSessions.id, existing.id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-    }
-
-    return db
-      .insert(agentTaskSessions)
-      .values({
-        companyId: input.companyId,
-        agentId: input.agentId,
-        adapterType: input.adapterType,
-        taskKey: input.taskKey,
-        sessionParamsJson: input.sessionParamsJson,
-        sessionDisplayId: input.sessionDisplayId,
-        lastRunId: input.lastRunId,
-        lastError: input.lastError,
-      })
-      .returning()
-      .then((rows) => rows[0] ?? null);
-  }
-
+  // Explicit (operator) clear. Rows become tombstones stamped with the clear
+  // time instead of being deleted, so a run that started before the clear
+  // cannot write its pre-clear session back when it finalizes. Returns the
+  // number of live sessions that were cleared.
   async function clearTaskSessions(
     companyId: string,
     agentId: string,
@@ -8861,11 +8976,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       conditions.push(eq(agentTaskSessions.adapterType, opts.adapterType));
     }
 
-    return db
-      .delete(agentTaskSessions)
-      .where(and(...conditions))
-      .returning()
-      .then((rows) => rows.length);
+    return db.transaction(async (tx) => {
+      const live = await tx
+        .select({ id: agentTaskSessions.id })
+        .from(agentTaskSessions)
+        .where(and(
+          ...conditions,
+          liveTaskSessionCondition,
+        ));
+      const tombstone = {
+        sessionParamsJson: null,
+        sessionDisplayId: null,
+        lastRunId: null,
+        lastError: null,
+        updatedAt: new Date(),
+      };
+      if (opts?.taskKey && opts.adapterType) {
+        // A targeted clear also covers a task whose first run is still in
+        // flight and has not written a row yet.
+        await tx
+          .insert(agentTaskSessions)
+          .values({ companyId, agentId, adapterType: opts.adapterType, taskKey: opts.taskKey, ...tombstone })
+          .onConflictDoUpdate({
+            target: [
+              agentTaskSessions.companyId,
+              agentTaskSessions.agentId,
+              agentTaskSessions.adapterType,
+              agentTaskSessions.taskKey,
+            ],
+            set: tombstone,
+          });
+      } else {
+        await tx.update(agentTaskSessions).set(tombstone).where(and(...conditions));
+      }
+      return live.length;
+    });
   }
 
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
@@ -8925,48 +9070,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null,
   ) {
-    return setRunStatusFromLive(runId, status, ["running"], patch);
+    return setRunStatusFromLive(runId, status, ["running"], patch, taskSessionMutation);
   }
 
   // Move a run to a new status only when its current status is one of
   // `fromStatuses`. The compare-and-set is a single conditional update, so a
   // concurrent path can win the race. When this update matches nothing, the
   // function reads the current row and reports updated=false, so the caller can
-  // keep the terminal outcome that another path already wrote.
+  // keep the terminal outcome that another path already wrote. A task-session
+  // mutation, when given, commits in the same transaction as the status write,
+  // before any live event or follow-up can observe the new status.
   async function setRunStatusFromLive(
     runId: string,
     status: string,
-    fromStatuses: string[],
+    fromStatuses: readonly string[],
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    taskSessionMutation?: FinalizeRunTaskSessionMutation | null,
   ) {
-    const updated = await db
-      .update(heartbeatRuns)
-      .set({ status, ...patch, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, fromStatuses)))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const finalization = await finalizeRunningRunWithTaskSession(db, {
+      runId,
+      status,
+      patch,
+      taskSessionMutation,
+      expectedStatuses: fromStatuses,
+    });
+    if (!finalization.updated) return finalization;
 
-    if (updated) {
-      if (isHeartbeatRunTerminalStatus(updated.status)) {
-        clearHeartbeatRunRuntimeStatus(updated.id);
-      }
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
-      return { run: updated, updated: true as const };
+    const updated = finalization.run;
+    if (isHeartbeatRunTerminalStatus(updated.status)) {
+      clearHeartbeatRunRuntimeStatus(updated.id);
     }
-
-    const current = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-
-    return { run: current, updated: false as const };
+    publishLiveEvent({
+      companyId: updated.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(updated),
+    });
+    publishRunLifecyclePluginEvent(updated);
+    return finalization;
   }
 
   // Invariant: when a run releases its environment lease, the run row must be
@@ -16254,6 +16396,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      const taskSessionMutation: FinalizeRunTaskSessionMutation | null = !taskKey
+        ? null
+        : adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)
+          ? {
+              kind: "clear",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+            }
+          : {
+              kind: "upsert",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                nextSessionState.params,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+              sessionDisplayId: nextSessionState.displayId,
+              lastError: runErrorMessage,
+            };
+
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -16268,7 +16435,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
-      });
+      }, taskSessionMutation);
       if (!persistedRunWrite.updated) {
         logger.info(
           {
@@ -16411,29 +16578,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
-        if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
-            await clearTaskSessions(agent.companyId, agent.id, {
-              taskKey,
-              adapterType: agent.adapterType,
-            });
-          } else {
-            await upsertTaskSession({
-              companyId: agent.companyId,
-              agentId: agent.id,
-              adapterType: agent.adapterType,
-              taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-              sessionDisplayId: nextSessionState.displayId,
-              lastRunId: finalizedRun.id,
-              lastError: runErrorMessage,
-            });
-          }
-        }
       }
       await finalizeAgentStatus(
         agent.id,
@@ -16479,6 +16623,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      const failedTaskSessionMutation: FinalizeRunTaskSessionMutation | null =
+        taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)
+          ? {
+              kind: "upsert",
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                previousSessionParams,
+                configuredModel,
+                sessionConfigMetadata,
+              ),
+              sessionDisplayId: previousSessionDisplayId,
+              lastError: message,
+            }
+          : null;
+
       const failedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: message,
         errorCode: failureErrorCode,
@@ -16493,7 +16655,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
-      });
+      }, failedTaskSessionMutation);
       if (!failedRunWrite.updated) {
         logger.info(
           {
@@ -16550,23 +16712,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
-
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
-              previousSessionParams,
-              configuredModel,
-              sessionConfigMetadata,
-            ),
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
-        }
       }
 
       await finalizeAgentStatus(agent.id, "failed", message, {
@@ -18937,13 +19082,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runningProcesses.delete(run.id);
     }
 
+    // The adapter may finalize (and checkpoint its session) while the process
+    // is being terminated; that terminal outcome wins over the cancel.
     const finishedAt = new Date();
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    const cancelledWrite = await setRunStatusFromLive(run.id, "cancelled", CANCELLABLE_HEARTBEAT_RUN_STATUSES, {
       finishedAt,
       error: reason,
       errorCode,
       ...(resultJson ? { resultJson } : {}),
     });
+    if (!cancelledWrite.updated) return cancelledWrite.run;
+    const cancelled = cancelledWrite.run;
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt,
@@ -18975,8 +19124,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
+    let cancelledCount = 0;
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const cancelledWrite = await setRunStatusFromLive(run.id, "cancelled", CANCELLABLE_HEARTBEAT_RUN_STATUSES, {
         finishedAt: new Date(),
         error: reason,
         errorCode,
@@ -18988,11 +19138,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
         } : {}),
       });
-
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
-        error: reason,
-      });
+      const cancelled = cancelledWrite.updated ? cancelledWrite.run : null;
+      if (cancelled) {
+        cancelledCount += 1;
+        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+          finishedAt: new Date(),
+          error: reason,
+        });
+      }
 
       const running = runningProcesses.get(run.id);
       if (running) {
@@ -19008,10 +19161,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      if (cancelled) {
+        await releaseIssueExecutionAndPromote(cancelled);
+      }
     }
 
-    return runs.length;
+    return cancelledCount;
   }
 
   async function cancelPendingWakeupsForAgentsInternal(agentIds: string[], reason: string) {
@@ -19211,7 +19366,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const latestTaskSession = await db
         .select()
         .from(agentTaskSessions)
-        .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id)))
+        .where(and(
+          eq(agentTaskSessions.companyId, agent.companyId),
+          eq(agentTaskSessions.agentId, agent.id),
+          liveTaskSessionCondition,
+        ))
         .orderBy(desc(agentTaskSessions.updatedAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
@@ -19229,7 +19388,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return db
         .select()
         .from(agentTaskSessions)
-        .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId)))
+        .where(and(
+          eq(agentTaskSessions.companyId, agent.companyId),
+          eq(agentTaskSessions.agentId, agentId),
+          liveTaskSessionCondition,
+        ))
         .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt));
     },
 

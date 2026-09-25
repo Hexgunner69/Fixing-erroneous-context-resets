@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   companies,
   companyMemberships,
@@ -106,6 +107,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issues);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companyMemberships);

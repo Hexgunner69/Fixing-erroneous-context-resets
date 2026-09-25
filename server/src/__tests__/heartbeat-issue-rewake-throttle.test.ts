@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -93,6 +94,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
         await db.delete(heartbeatRuns);
         await db.delete(agentWakeupRequests);
         await db.delete(agentRuntimeState);
+        await db.delete(agentTaskSessions);
         await db.delete(agents);
         await db.delete(environments);
         await db.delete(executionWorkspaces);

@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agents,
   agentWakeupRequests,
   companies,
@@ -95,6 +96,7 @@ describeEmbeddedPostgres("issue create onboarding first-task routes", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issues);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(companies);

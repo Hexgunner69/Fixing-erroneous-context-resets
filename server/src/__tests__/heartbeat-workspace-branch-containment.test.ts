@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -900,6 +901,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     await db.delete(projects);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);

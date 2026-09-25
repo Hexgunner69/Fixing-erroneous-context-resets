@@ -9,6 +9,7 @@ import {
   activityLog,
   agentWakeupRequests,
   agentRuntimeState,
+  agentTaskSessions,
   agents,
   approvals,
   assets,
@@ -732,6 +733,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(agentRuntimeState);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(projects);
     await deleteCompanySkillsAfterLateHeartbeatWritesDrain(db);

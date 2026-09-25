@@ -9,6 +9,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   authUsers,
   budgetPolicies,
@@ -425,11 +426,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(budgetPolicies);
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      // A still-alive recovery child process can insert a new wakeup request
-      // or runtime-state row after the first delete. Re-clear both rows each
-      // attempt so a late insert cannot hold the agents foreign key.
+      // A still-alive recovery child process can insert a new wakeup request,
+      // runtime-state row, or task-session checkpoint after the first delete.
+      // Re-clear those rows each attempt so a late insert cannot hold the
+      // agents foreign key.
       await db.delete(agentWakeupRequests);
       await db.delete(agentRuntimeState);
+      await db.delete(agentTaskSessions);
       try {
         await db.delete(agents);
         break;

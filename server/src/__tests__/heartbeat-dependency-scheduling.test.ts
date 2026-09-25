@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   companySkills,
   companies,
@@ -145,6 +146,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(environments);

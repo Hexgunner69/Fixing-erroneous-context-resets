@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   activityLog,
   budgetPolicies,
@@ -160,6 +161,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);
+    await db.delete(agentTaskSessions);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(companySkills);
