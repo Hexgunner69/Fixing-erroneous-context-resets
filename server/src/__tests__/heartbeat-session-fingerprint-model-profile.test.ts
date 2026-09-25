@@ -264,6 +264,53 @@ describe("session fingerprint model-profile normalization", () => {
   });
 
   describe("sessions checkpointed by 2026.824.1", () => {
+    it("resumes a legacy disabled-request session on an ordinary retry with no request", async () => {
+      const next = await buildEffectiveRunSessionConfigMetadata(sessionInput());
+      expect(freshness(LEGACY_824_1.disabledRequest, next)).toMatchObject({ reset: false, changedCategories: [] });
+    });
+
+    it("resumes a legacy disabled-request session when only the request provenance or fallback changed", async () => {
+      const variants = [
+        UNSUPPORTED_CHEAP_REQUEST,
+        { ...DISABLED_CHEAP_REQUEST, requestedBy: "issue_override" },
+        { ...DISABLED_CHEAP_REQUEST, fallbackReason: "adapter_profile_resolution_failed" },
+      ];
+      for (const modelProfile of variants) {
+        const next = await buildEffectiveRunSessionConfigMetadata(sessionInput({ modelProfile }));
+        expect(freshness(LEGACY_824_1.disabledRequest, next), JSON.stringify(modelProfile))
+          .toMatchObject({ reset: false, changedCategories: [] });
+      }
+    });
+
+    it("resumes a legacy applied-profile session when only the request source changed", async () => {
+      const next = await buildEffectiveRunSessionConfigMetadata(sessionInput({
+        modelProfile: { ...APPLIED_CHEAP, requestedBy: "issue_override" },
+        effectiveAdapterConfig: CHEAP_ADAPTER_CONFIG,
+      }));
+      expect(freshness(LEGACY_824_1.appliedProfile, next, "gpt-5.4-nano")).toMatchObject({
+        reset: false,
+        changedCategories: [],
+      });
+    });
+
+    it("still resets a legacy disabled-request session on a real change", async () => {
+      const next = await buildEffectiveRunSessionConfigMetadata(sessionInput({ effectiveAdapterConfig: CHEAP_ADAPTER_CONFIG }));
+      expect(freshness(LEGACY_824_1.disabledRequest, next)).toMatchObject({
+        reset: true,
+        changedCategories: ["adapterConfig"],
+      });
+    });
+
+    it("still resets a legacy not-applied session when a profile is now applied", async () => {
+      const next = await buildEffectiveRunSessionConfigMetadata(sessionInput({
+        modelProfile: APPLIED_CHEAP,
+        effectiveAdapterConfig: CHEAP_ADAPTER_CONFIG,
+      }));
+      const decision = freshness(LEGACY_824_1.disabledRequest, next, "gpt-5.4-nano");
+      expect(decision.reset).toBe(true);
+      expect(decision.changedCategories).toEqual(expect.arrayContaining(["modelProfile", "adapterConfig"]));
+    });
+
     it("keeps the common no-request fingerprint byte-identical", async () => {
       const next = await buildEffectiveRunSessionConfigMetadata(sessionInput());
       expect(next.fingerprint).toBe(LEGACY_824_1.noRequest.fingerprint);
