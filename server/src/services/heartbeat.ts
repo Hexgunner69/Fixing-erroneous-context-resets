@@ -353,6 +353,7 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
+const PAPERCLIP_RETURN_ASSIGNMENT_KEY = "paperclipReturnAssignment";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
@@ -4116,10 +4117,16 @@ export function deriveTaskKeyWithHeartbeatFallback(
 
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { returningAssignee?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  // An assignment starts a fresh session, except when the task is handed back
+  // to an agent that still holds a healthy session for it (see
+  // resolveReturnAssignmentTaskSession). That session still has to pass the
+  // effective-config and workspace freshness checks before it is resumed.
+  if (wakeReason === "issue_assigned" && options.returningAssignee === true) return false;
   if (
     wakeReason === "issue_assigned" ||
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
@@ -4133,6 +4140,62 @@ export function shouldResetTaskSessionForWake(
     return true;
   }
   return false;
+}
+
+// A task handed back to an agent that already holds a session for it. Only a
+// healthy session qualifies: an explicit fresh-session request, a tombstoned
+// or missing session, or one whose last run failed all keep the assignment
+// reset.
+export function resolveReturnAssignmentTaskSession(input: {
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId" | "lastError" | "updatedAt"> | null;
+}) {
+  if (input.contextSnapshot?.forceFreshSession === true) return null;
+  if (readNonEmptyString(input.contextSnapshot?.wakeReason) !== "issue_assigned") return null;
+  const session = input.taskSession;
+  if (!session || session.lastError) return null;
+  return { checkpointAt: session.updatedAt, lastRunId: session.lastRunId };
+}
+
+// Comments other authors posted on the issue since the returning agent's last
+// checkpointed run started (a comment posted during that run may never have
+// reached it), newest last. At most `limit` are returned; `truncated` says
+// older ones were left for the agent to fetch.
+async function listReturnAssignmentInterveningCommentIds(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    checkpointRunId: string | null;
+    checkpointAt: Date;
+    limit: number;
+  },
+) {
+  const checkpointRunStartedAt = input.checkpointRunId
+    ? await db
+      .select({ startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.checkpointRunId), eq(heartbeatRuns.companyId, input.companyId)))
+      .then((rows) => rows[0]?.startedAt ?? null)
+    : null;
+  const since = checkpointRunStartedAt ?? input.checkpointAt;
+  const rows = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(and(
+      eq(issueComments.companyId, input.companyId),
+      eq(issueComments.issueId, input.issueId),
+      gt(issueComments.createdAt, since),
+      isNull(issueComments.deletedAt),
+      or(isNull(issueComments.authorAgentId), ne(issueComments.authorAgentId, input.agentId)),
+    ))
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
+    .limit(input.limit + 1);
+  return {
+    commentIds: rows.slice(0, input.limit).map((row) => row.id).reverse(),
+    truncated: rows.length > input.limit,
+  };
 }
 
 function shouldRequireIssueCommentForWake(
@@ -4228,11 +4291,14 @@ export function filterZombieCoalesceTarget<
 
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { returningAssignee?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return "forceFreshSession was requested";
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_assigned") {
+    return options.returningAssignee === true ? null : "wake reason is issue_assigned";
+  }
   if (wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON) {
     return `wake reason is ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON}`;
   }
@@ -5603,7 +5669,21 @@ export async function buildPaperclipWakePayload(input: {
   simplifiedEnglishInteractions?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const wakeCommentIds = extractWakeCommentIds(input.contextSnapshot);
+  const returnAssignment = parseObject(input.contextSnapshot[PAPERCLIP_RETURN_ASSIGNMENT_KEY]);
+  const interveningCandidates = (Array.isArray(returnAssignment.interveningCommentIds)
+    ? returnAssignment.interveningCommentIds
+    : [])
+    .map((value) => readNonEmptyString(value))
+    .filter((value): value is string => value !== null && !wakeCommentIds.includes(value));
+  // Keep the comments that actually triggered this wake; fill the remaining
+  // inline slots with the newest intervening comments.
+  const interveningRoom = Math.max(0, MAX_INLINE_WAKE_COMMENTS - wakeCommentIds.length);
+  const interveningCommentIds = interveningRoom > 0 ? interveningCandidates.slice(-interveningRoom) : [];
+  const interveningCommentsTruncated =
+    returnAssignment.interveningCommentsTruncated === true
+    || interveningCommentIds.length < interveningCandidates.length;
+  const commentIds = [...interveningCommentIds, ...wakeCommentIds];
   const annotationCommentId = readNonEmptyString(input.contextSnapshot.annotationCommentId);
   const issueId = readNonEmptyString(input.contextSnapshot.issueId);
   const continuationSummary = input.continuationSummary ?? null;
@@ -5804,7 +5884,8 @@ export async function buildPaperclipWakePayload(input: {
       includeForAnnotationDelta: annotationDeltas.length > 0,
     })
     : null;
-  const payloadTruncated = truncated || issueDescriptionTruncated || planReviewContext?.truncated === true || documentReviewContext?.truncated === true;
+  const payloadTruncated = truncated || issueDescriptionTruncated || planReviewContext?.truncated === true || documentReviewContext?.truncated === true
+    || interveningCommentsTruncated;
   const recoveryActionId = readNonEmptyString(input.contextSnapshot.recoveryActionId);
   const recoveryCause = readNonEmptyString(input.contextSnapshot.recoveryCause);
   const recoveryAction = recoveryActionId
@@ -14354,6 +14435,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
+    const returnAssignment = resolveReturnAssignmentTaskSession({ contextSnapshot: context, taskSession });
     const taskSessionDecodedParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
     );
@@ -14427,6 +14509,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     } else {
       delete context.paperclipSkillTest;
+    }
+    if (returnAssignment && issueRef) {
+      const intervening = await listReturnAssignmentInterveningCommentIds(db, {
+        companyId: agent.companyId,
+        issueId: issueRef.id,
+        agentId: agent.id,
+        checkpointRunId: returnAssignment.lastRunId,
+        checkpointAt: returnAssignment.checkpointAt,
+        limit: MAX_INLINE_WAKE_COMMENTS,
+      });
+      context[PAPERCLIP_RETURN_ASSIGNMENT_KEY] = {
+        previousCheckpointAt: returnAssignment.checkpointAt.toISOString(),
+        previousRunId: returnAssignment.lastRunId,
+        interveningCommentIds: intervening.commentIds,
+        interveningCommentsTruncated: intervening.truncated,
+      };
+    } else {
+      delete context[PAPERCLIP_RETURN_ASSIGNMENT_KEY];
     }
     const paperclipWakePayload = await buildPaperclipWakePayload({
       db,
@@ -14871,7 +14971,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
     });
     const configuredModel = readConfiguredModelFromAdapterConfig(runtimeConfig);
-    const wakeSessionResetReason = describeSessionResetReason(context);
+    const returningAssignee = returnAssignment !== null;
+    const wakeSessionResetReason = describeSessionResetReason(context, { returningAssignee });
     const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
       hasTaskSession: taskSession != null,
       configuredModel,
@@ -14880,7 +14981,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeResetReason: wakeSessionResetReason,
       preserveLegacySessionWithoutConfigMetadata: acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
     });
-    const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+    const resetTaskSession = shouldResetTaskSessionForWake(context, { returningAssignee }) || sessionConfigFreshness.reset;
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const previousSessionParams =
@@ -15605,6 +15706,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         changedCategories: sessionConfigFreshness.changedCategories,
         taskSessionAvailable: taskSession != null,
         taskSessionReused: taskSessionForRun != null,
+        returningAssignee,
         storedFingerprintPresent: Boolean(sessionConfigFreshness.storedFingerprint),
         nextFingerprint: sessionConfigFreshness.nextFingerprint,
       },
